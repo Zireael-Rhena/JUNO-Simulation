@@ -1,14 +1,32 @@
 import numpy as np
 
-
 def ray_sphere_intersection_vectorized(ray_origins, ray_dirs, sphere_center, sphere_radius):
     """
-    完全矢量化的射线-球面交点计算
+    射线-球面交点计算。
+    
+    使用矢量化操作计算多条射线与球面的交点，提高计算效率。
+    采用射线-球面求交的标准算法，通过求解二次方程来确定交点。
+    
+    Args:
+        ray_origins (numpy.ndarray): 射线起点坐标，形状为 (N, 3)
+        ray_dirs (numpy.ndarray): 射线方向向量（应已归一化），形状为 (N, 3)
+        sphere_center (numpy.ndarray): 球心坐标，形状为 (3,)
+        sphere_radius (float): 球面半径
+        
+    Returns:
+        tuple: 包含两个元素的元组
+            - intersections (numpy.ndarray): 交点坐标，形状为 (N, 3)
+            - final_valid (numpy.ndarray): 布尔掩码，标识有效交点，形状为 (N,)
+            
+    Note:
+        - 对于每条射线，优先选择较近的交点（t1）
+        - 如果t1 <= 0，则选择较远的交点（t2）
+        - 使用eps=1e-6作为数值精度阈值
     """
     # 向量从球心到射线起点
     oc = ray_origins - sphere_center
 
-    # 使用更快的点积计算
+    # 使用点积计算
     a = (ray_dirs * ray_dirs).sum(axis=1)
     b = 2 * (oc * ray_dirs).sum(axis=1)
     c = (oc * oc).sum(axis=1) - sphere_radius**2
@@ -26,7 +44,6 @@ def ray_sphere_intersection_vectorized(ray_origins, ray_dirs, sphere_center, sph
     if not np.any(valid_mask):
         return intersections, final_valid
 
-    # 直接在原数组上操作，减少临时数组
     sqrt_disc = np.zeros_like(discriminant)
     sqrt_disc[valid_mask] = np.sqrt(discriminant[valid_mask])
 
@@ -52,7 +69,28 @@ def ray_sphere_intersection_vectorized(ray_origins, ray_dirs, sphere_center, sph
 
 def compute_refraction_vectorized(incident_dirs, normals, n1, n2):
     """
-    完全矢量化的折射计算
+    光线折射计算。
+    
+    根据斯涅尔定律计算光线在介质界面的折射方向。使用矢量化操作
+    同时处理多条光线，提高计算效率。自动处理全反射情况。
+    
+    Args:
+        incident_dirs (numpy.ndarray): 入射光线方向向量，形状为 (N, 3)
+        normals (numpy.ndarray): 界面法向量（指向入射介质），形状为 (N, 3)
+        n1 (float): 入射介质折射率
+        n2 (float): 折射介质折射率
+        
+    Returns:
+        tuple: 包含两个元素的元组
+            - refract_dirs (numpy.ndarray): 折射光线方向向量，形状为 (N, 3)
+            - total_reflection (numpy.ndarray): 全反射掩码，形状为 (N,)，
+              True表示发生全反射，False表示发生折射
+              
+    Note:
+        - 使用斯涅尔定律: n1 * sin(θ1) = n2 * sin(θ2)
+        - 当 sin²(θ2) > 1 时发生全反射
+        - 自动处理光线从内部射向外部的情况（cos_i < 0）
+        - 折射方向向量已归一化
     """
     # 计算入射角余弦
     cos_i = -np.sum(incident_dirs * normals, axis=1)
@@ -92,7 +130,23 @@ def compute_refraction_vectorized(incident_dirs, normals, n1, n2):
 
 def is_front_surface_improved(pmt_pos, intersection_points):
     """
-    改进的PMT前表面判断
+    PMT前表面判断算法。
+    
+    判断光线与PMT球体的交点是否位于前表面（面向探测器中心的一侧）。
+    通过计算交点相对于PMT中心的位置向量与PMT指向球心方向的夹角来判断。
+    
+    Args:
+        pmt_pos (numpy.ndarray): PMT中心位置坐标，形状为 (3,)
+        intersection_points (numpy.ndarray): 光线与PMT的交点坐标，形状为 (N, 3)
+        
+    Returns:
+        numpy.ndarray: 布尔数组，形状为 (N,)
+            True表示交点位于前表面，False表示位于后表面
+            
+    Note:
+        - 前表面定义：法向量与指向球心方向的夹角 < 90度（点积 > 0）
+        - 后表面定义：法向量与指向球心方向的夹角 > 90度（点积 < 0）
+        - 假设PMT位于以原点为中心的球面上
     """
     pmt_center = pmt_pos
     pmt_to_center_dir = -pmt_center / np.linalg.norm(pmt_center)
