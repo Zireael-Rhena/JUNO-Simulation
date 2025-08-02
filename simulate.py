@@ -3,8 +3,6 @@ import sys
 import numpy as np
 import time
 import psutil
-from scipy.spatial import KDTree
-from functools import lru_cache
 import h5py as h5
 from tqdm import tqdm
 
@@ -27,87 +25,166 @@ print(f"  Light speeds: C_LS = {C_LS:.3f} mm/ns, C_WATER = {C_WATER:.3f} mm/ns")
 
 # 优化的PMT模拟器类
 class OptimizedPMTSimulator:
-    """优化的PMT模拟器类"""
-    
+    """
+    PMT（光电倍增管）模拟器类。
+
+    该类用于模拟光子与PMT的相互作用，包括几何筛选、菲涅尔反射等物理过程。
+    采用矢量化计算提高性能，适用于大规模蒙特卡罗模拟。
+
+    Attributes:
+        pmt_positions (numpy.ndarray): PMT位置坐标数组，形状为 (n_pmts, 3)
+        channel_ids (numpy.ndarray): PMT通道ID数组
+        pmt_normals (numpy.ndarray): PMT法向量数组，指向球心方向
+    """
+
     def __init__(self, pmt_positions, channel_ids):
+        """
+        初始化PMT模拟器。
+
+        Args:
+            pmt_positions (numpy.ndarray): PMT位置坐标数组，形状为 (n_pmts, 3)
+            channel_ids (numpy.ndarray): PMT通道ID数组，长度为 n_pmts
+
+        Note:
+            - PMT位置应为探测器球面上的坐标
+            - 通道ID用于识别和记录击中的PMT
+        """
         self.pmt_positions = pmt_positions
         self.channel_ids = channel_ids
-        self.pmt_kdtree = None
         self.pmt_normals = None
         self._initialize_pmt_data()
-    
+
     def _initialize_pmt_data(self):
-        """初始化PMT数据结构"""
-        # 创建PMT位置的KDTree索引
-        self.pmt_kdtree = KDTree(self.pmt_positions)
+        """
+        初始化PMT相关的数据结构。
         
+        计算PMT的法向量，用于后续的光学计算。法向量指向球心方向，
+        
+        Note:
+            - 法向量已归一化为单位向量
+            - 假设PMT位于以原点为中心的球面上
+        """
         # 计算PMT法向量（指向球心）
         self.pmt_normals = -self.pmt_positions / np.linalg.norm(self.pmt_positions, axis=1, keepdims=True)
-        
-    
-    def geometric_prefilter(self, vertex_pos, refract_origins, refract_directions, max_angle_cos=-0.3):
-        """基于几何约束预筛选可能击中的PMT"""
+
+
+    def geometric_prefilter(self, vertex_pos, refract_directions, max_angle_cos=-0.5):
+        """
+        基于几何约束预筛选可能被光子击中的PMT。
+
+        通过计算光子传播方向与顶点-PMT连线的夹角来判断光子是否可能击中PMT。
+        这是一种快速的几何预筛选方法，可以显著减少后续精确计算的PMT数量。
+
+        Args:
+            vertex_pos (numpy.ndarray): 顶点位置坐标，形状为 (3,)
+            refract_directions (numpy.ndarray): 折射光子方向，形状为 (n_photons, 3)
+            max_angle_cos (float, optional): 最大接受角的余弦值，默认为 -0.5
+                对应120度角，用于控制预筛选的严格程度
+
+        Returns:
+            numpy.ndarray: 可能被击中的PMT索引数组
+
+        Note:
+            - max_angle_cos 值越大，筛选越严格，保留的PMT越少
+            - max_angle_cos = -1 表示接受所有方向（180度）
+            - max_angle_cos = 0 表示只接受90度以内的角度
+            - 该方法假设光子从顶点位置开始传播
+
+        Algorithm:
+            1. 计算顶点到各PMT的方向向量
+            2. 计算每个光子方向与各PMT方向的夹角余弦值
+            3. 如果任一光子可能击中某PMT，则保留该PMT
+        """
         # 计算顶点到PMT的方向向量
         vertex_to_pmts = self.pmt_positions - vertex_pos
         vertex_to_pmts_norm = vertex_to_pmts / np.linalg.norm(vertex_to_pmts, axis=1, keepdims=True)
-        
+
         # 对于每个折射光子，计算与PMT方向的夹角
         cos_angles = np.dot(refract_directions, vertex_to_pmts_norm.T)
-        
+
         # 如果任何光子可能击中该PMT，则保留
         viable_pmt_mask = np.any(cos_angles > max_angle_cos, axis=0)
-        
+
         return np.where(viable_pmt_mask)[0]
-    
-    def kdtree_prefilter(self, refract_origins, refract_directions, search_radius=50000):
-        """使用KDTree进行PMT预筛选"""
-        # 计算光线在PMT球面上的大致投影点
-        sphere_center = np.array([0, 0, 0])
-        estimated_distances = np.linalg.norm(refract_origins - sphere_center, axis=1)
-        
-        # 估计光线与PMT球面的交点
-        projection_points = refract_origins + refract_directions * estimated_distances[:, np.newaxis]
-        
-        # 使用KDTree查找附近的PMT
-        nearby_pmts = set()
-        for point in projection_points:
-            distances, indices = self.pmt_kdtree.query(point, k=10, distance_upper_bound=search_radius)
-            valid_indices = indices[distances < np.inf]
-            nearby_pmts.update(valid_indices)
-        
-        return list(nearby_pmts)
-    
+
     def compute_fresnel_reflection(self, incident_dirs, normals, n1=N_LS, n2=N_WATER):
-        """计算菲涅尔反射系数"""
+        """
+        计算菲涅尔反射系数。
+        
+        根据菲涅尔方程计算光子在介质界面的反射概率。考虑了s偏振和p偏振
+        光的不同反射特性，并处理全反射情况。
+
+        Args:
+            incident_dirs (numpy.ndarray): 入射光方向向量，形状为 (n_photons, 3)
+            normals (numpy.ndarray): 界面法向量，形状为 (n_photons, 3)
+            n1 (float, optional): 入射介质折射率，默认为 N_LS（液闪）
+            n2 (float, optional): 折射介质折射率，默认为 N_WATER（水）
+
+        Returns:
+            numpy.ndarray: 菲涅尔反射系数数组，取值范围 [0, 1]
+
+        Note:
+            - 返回值为s偏振和p偏振反射系数的平均值
+            - 全反射情况下反射系数为1.0
+            - 正入射时s偏振和p偏振系数相等
+            - 使用clip确保数值稳定性
+        """
         cos_i = np.abs(np.sum(incident_dirs * normals, axis=1))
         cos_i = np.clip(cos_i, 0, 1)
-        
+
         sin_i = np.sqrt(1 - cos_i**2)
         sin_t = (n1/n2) * sin_i
-        
+
         # 处理全反射情况
         total_reflection = sin_t >= 1.0
         cos_t = np.sqrt(np.maximum(0, 1 - sin_t**2))
-        
+
         # s偏振和p偏振反射系数
         Rs = np.zeros_like(cos_i)
         Rp = np.zeros_like(cos_i)
-        
+
         valid_mask = ~total_reflection
         if np.any(valid_mask):
-            Rs[valid_mask] = ((n1*cos_i[valid_mask] - n2*cos_t[valid_mask]) / 
+            Rs[valid_mask] = ((n1*cos_i[valid_mask] - n2*cos_t[valid_mask]) /
                              (n1*cos_i[valid_mask] + n2*cos_t[valid_mask]))**2
-            Rp[valid_mask] = ((n1*cos_t[valid_mask] - n2*cos_i[valid_mask]) / 
+            Rp[valid_mask] = ((n1*cos_t[valid_mask] - n2*cos_i[valid_mask]) /
                              (n1*cos_t[valid_mask] + n2*cos_i[valid_mask]))**2
-        
+
         # 全反射情况
         Rs[total_reflection] = 1.0
         Rp[total_reflection] = 1.0
-        
+
         return (Rs + Rp) / 2
 
 def validate_physics(vertex_pos, photon_dirs, intersections=None):
-    """验证物理约束"""
+    """
+    验证物理约束条件。
+
+    对蒙特卡罗模拟中的物理参数进行验证，确保顶点位置、光子方向等
+    参数符合物理约束条件。
+
+    Args:
+        vertex_pos (numpy.ndarray): 顶点位置坐标，形状为 (3,)
+        photon_dirs (numpy.ndarray): 光子方向向量数组，形状为 (n_photons, 3)
+        intersections (numpy.ndarray, optional): 光子与界面的交点坐标，
+            形状为 (n_intersections, 3)。当前版本未使用，预留扩展用
+
+    Returns:
+        bool: 验证结果
+            - True: 所有物理约束都满足
+            - False: 存在违反物理约束的情况
+
+    Physical Constraints:
+        1. 顶点约束：顶点必须位于液体闪烁体球内 (r < R_LS)
+        2. 方向约束：光子方向向量必须是单位向量 (|v| = 1)
+        3. 扩展约束：可通过 intersections 参数添加更多验证
+
+    Note:
+        - 使用容差值 1e-6 进行数值比较
+        - 违反约束时会输出警告信息
+        - 可用于调试和模拟质量检查
+        - intersections 参数预留给未来版本使用
+    """
     # 检查顶点是否在液闪内
     r_vertex = np.linalg.norm(vertex_pos)
     if r_vertex >= R_LS:
@@ -124,8 +201,45 @@ def validate_physics(vertex_pos, photon_dirs, intersections=None):
 
 def simulate_vertex_to_pmts(vertex_pos, photon_dirs, emission_times, pmt_positions, channel_ids, target_pmt_id=None, batch_size=50000):
     """
-    模拟单个顶点到PMT的光子传输
-    target_pmt_id: 如果指定，只模拟该PMT；如果为None，模拟所有PMT
+    模拟单个顶点到PMT的光子传输过程。
+
+    完整模拟光子从顶点出发，经过液闪-水界面折射，最终击中PMT的物理过程。
+    包括光线追踪、界面折射、菲涅尔反射、传播时间计算等。
+
+    Args:
+        vertex_pos (numpy.ndarray): 顶点位置坐标，形状为 (3,)
+        photon_dirs (numpy.ndarray): 光子发射方向，形状为 (n_photons, 3)
+        emission_times (numpy.ndarray): 光子发射时间，形状为 (n_photons,)
+        pmt_positions (numpy.ndarray): PMT位置数组，形状为 (n_pmts, 3)
+        channel_ids (numpy.ndarray): PMT通道ID数组，形状为 (n_pmts,)
+        target_pmt_id (int, list, numpy.ndarray, optional): 目标PMT ID
+            - int: 模拟单个PMT
+            - list/array: 模拟指定的多个PMT
+            - None: 模拟所有PMT（默认）
+        batch_size (int, optional): 批处理大小，默认50000。用于控制内存使用
+
+    Returns:
+        list: 击中数据列表，每个元素为 (channel_id, hit_time) 元组
+
+    Physical Processes:
+        1. 光子从顶点各向同性发射
+        2. 在液体闪烁体中直线传播
+        3. 在液闪-水界面发生折射
+        4. 在水中继续传播至PMT
+        5. 在PMT表面考虑菲涅尔反射
+        6. 记录透射光子的击中时间
+
+    Performance Optimization:
+        - 使用批处理减少内存占用
+        - 几何预筛选减少计算量（大规模PMT阵列）
+        - 矢量化操作提高效率
+        - 早期退出避免无效计算
+
+    Note:
+        - 忽略全反射光子
+        - 只考虑前表面击中
+        - 包含物理约束验证
+        - 支持大规模PMT阵列
     """
     n_photons = len(photon_dirs)
     hit_data = []
@@ -134,7 +248,7 @@ def simulate_vertex_to_pmts(vertex_pos, photon_dirs, emission_times, pmt_positio
     if not validate_physics(vertex_pos, photon_dirs):
         print("Warning: Physical constraints violated")
 
-    # 创建优化的PMT模拟器（仅在模拟所有PMT时使用）
+    # 创建优化的PMT模拟器
     pmt_simulator = None
     if target_pmt_id is None and len(pmt_positions) > 1000:
         pmt_simulator = OptimizedPMTSimulator(pmt_positions, channel_ids)
@@ -198,30 +312,17 @@ def simulate_vertex_to_pmts(vertex_pos, photon_dirs, emission_times, pmt_positio
                 pmt_indices = [idx for idx in target_pmt_id if 0 <= idx < len(pmt_positions)]
             else:
                 raise ValueError(f"target_pmt_id must be int, list, or None, got {type(target_pmt_id)}")
-            # print(f"Debug: Single PMT mode, PMT indices: {pmt_indices}")
         else:
             # 模拟所有PMT
             if pmt_simulator is not None:
                 # 使用几何预筛选
-                viable_pmt_indices = pmt_simulator.geometric_prefilter(
-                    vertex_pos, refract_origins, refract_directions
+                pmt_indices = pmt_simulator.geometric_prefilter(
+                    vertex_pos, refract_directions
                 )
-                # print(f"Debug: Geometric prefilter returned {len(viable_pmt_indices)} PMTs")
-                
-                # 如果PMT太多，再使用KDTree筛选
-                if len(viable_pmt_indices) > 1000:
-                    kdtree_pmts = pmt_simulator.kdtree_prefilter(refract_origins, refract_directions)
-                    # print(f"Debug: KDTree prefilter returned {len(kdtree_pmts)} PMTs")
-                    viable_pmt_indices = list(set(viable_pmt_indices) & set(kdtree_pmts))
-                    # print(f"Debug: Intersection returned {len(viable_pmt_indices)} PMTs")
-                
-                pmt_indices = viable_pmt_indices
             else:
-                # 小规模PMT，使用原有策略
+                # 小规模PMT，检查所有
                 pmt_indices = range(len(pmt_positions))
-                # print(f"Debug: Using all {len(pmt_indices)} PMTs (no optimizer)")
 
-        # print(f"Debug: Final PMT indices count: {len(pmt_indices)}")
         # 对选定的PMT检查交点
         for pmt_id in pmt_indices:
             pmt_pos = pmt_positions[pmt_id]
@@ -233,7 +334,7 @@ def simulate_vertex_to_pmts(vertex_pos, photon_dirs, emission_times, pmt_positio
             if not np.any(pmt_hit_mask):
                 continue
 
-            # 使用改进的前表面判断
+            # 使用前表面判断
             pmt_intersections_valid = pmt_intersections[pmt_hit_mask]
             front_surface_mask = is_front_surface_improved(pmt_pos, pmt_intersections_valid)
 
@@ -245,17 +346,17 @@ def simulate_vertex_to_pmts(vertex_pos, photon_dirs, emission_times, pmt_positio
                 pmt_normal = pmt_simulator.pmt_normals[pmt_id]
                 incident_dirs = refract_directions[pmt_hit_mask][front_surface_mask]
                 normals = np.tile(pmt_normal, (len(incident_dirs), 1))
-                
+
                 reflection_probs = pmt_simulator.compute_fresnel_reflection(incident_dirs, normals)
-                
+
                 # 根据反射概率决定光子命运
                 rng = np.random.default_rng()
                 random_probs = rng.random(len(reflection_probs))
                 transmitted_mask = random_probs > reflection_probs
-                
+
                 if not np.any(transmitted_mask):
                     continue
-                
+
                 # 只保留透射的光子
                 final_pmt_intersections = pmt_intersections_valid[front_surface_mask][transmitted_mask]
                 final_refract_origins = refract_origins[pmt_hit_mask][front_surface_mask][transmitted_mask]
@@ -282,10 +383,46 @@ def simulate_vertex_to_pmts(vertex_pos, photon_dirs, emission_times, pmt_positio
     return hit_data
 
 def main():
+    """
+    主模拟函数，执行完整的PMT光子击中模拟流程。
+
+    该函数执行以下主要步骤：
+    1. 解析命令行参数
+    2. 读取探测器几何配置
+    3. 执行蒙特卡罗光子传输模拟
+    4. 收集和统计结果
+    5. 保存模拟数据到HDF5文件
+
+    Physical Process:
+        - 在液体闪烁体球内随机生成顶点
+        - 从每个顶点各向同性发射固定数量的光子
+        - 模拟光子传输：液闪→水→PMT
+        - 记录击中PMT的光子时间和位置信息
+
+    Performance Features:
+        - 批处理减少内存占用
+        - 矢量化计算提高效率  
+        - 实时进度显示和性能监控
+        - 内存使用统计
+
+    Output Data:
+        - ParticleTruth: 包含事件ID、顶点位置、动量信息
+        - PETruth: 包含事件ID、PMT通道ID、击中时间
+        - 元数据: 模拟参数和性能统计
+
+    Note:
+        - 需要预先解析命令行参数（通过全局parser）
+        - 支持单个PMT、多个PMT或全部PMT的模拟
+        - 包含完整的错误处理和验证
+        - 输出详细的统计信息和性能指标
+
+    Raises:
+        SystemExit: 当几何文件读取失败或参数无效时退出
+    """
     # 解析命令行参数
     args = parser.parse_args()
 
-    # 读取几何文件
+    # 读取几何文件并处理PMT配置
     try:
         with h5.File(args.geo, "r") as geo:
             geo_data = geo["Geometry"]
@@ -293,18 +430,18 @@ def main():
             pmt_phi = geo_data["phi"][:]
             channel_ids = geo_data["ChannelID"][:]
 
-            # 转换为弧度并计算PMT位置
+            # 转换为弧度并计算PMT在球坐标系中的位置
             pmt_theta_rad = np.radians(pmt_theta)
             pmt_phi_rad = np.radians(pmt_phi)
 
-            # 计算PMT在球坐标系中的位置
+            # 计算笛卡尔坐标 (x, y, z)
             pmt_x = R_PMT * np.sin(pmt_theta_rad) * np.cos(pmt_phi_rad)
             pmt_y = R_PMT * np.sin(pmt_theta_rad) * np.sin(pmt_phi_rad)
             pmt_z = R_PMT * np.cos(pmt_theta_rad)
 
             pmt_positions = np.column_stack((pmt_x, pmt_y, pmt_z))
 
-            # 添加调试信息
+            # 验证和显示目标PMT配置信息
             if TARGET_PMT_ID is not None:
                 if isinstance(TARGET_PMT_ID, (int, np.integer)):
                     # 单个PMT
@@ -331,35 +468,35 @@ def main():
         print(f"Error reading geometry file '{args.geo}': {e}")
         sys.exit(1)
 
-    # 准备输出数据
+    # 准备输出数据容器
     particle_data = []
     pe_data = []
 
-    # 设置随机种子
+    # 设置随机种子以确保可重现性
     np.random.seed(42)
 
-    # 存储第一个事件的统计信息
+    # 存储第一个事件的详细统计信息用于物理验证
     first_event_stats = None
 
-    # 记录开始时间
+    # 初始化性能监控
     simulation_start_time = time.time()
     start_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
 
-    # 模拟每个事件
-    print("Starting optimized simulation...")
+    # 执行主模拟循环
+    print("Starting simulation...")
     for event_id in tqdm(range(args.n), desc="Simulating events"):
-        # 生成顶点位置
+        # 生成随机顶点位置（液闪球内均匀分布）
         vertex_positions = sample_uniform_sphere_vectorized(1)
         vertex_pos = vertex_positions[0]
 
-        # 记录粒子信息
+        # 记录粒子真实信息 (事件ID, x, y, z, 动量)
         particle_data.append((event_id, vertex_pos[0], vertex_pos[1], vertex_pos[2], MOMENTUM))
 
-        # 生成固定数量的光子
+        # 生成光子发射参数
         photon_dirs = sample_isotropic_direction_vectorized(N_PHOTONS)
         emission_times = sample_emission_time_vectorized(N_PHOTONS)
 
-        # 模拟光子传输（使用优化版本）
+        # 执行光子传输模拟
         hit_data = simulate_vertex_to_pmts(
             vertex_pos, photon_dirs, emission_times, pmt_positions, channel_ids, TARGET_PMT_ID)
 
@@ -367,7 +504,7 @@ def main():
         for channel_id, hit_time in hit_data:
             pe_data.append((event_id, int(channel_id), hit_time))
 
-        # 保存第一个事件的统计信息
+        # 保存第一个事件的详细统计信息用于验证
         if event_id == 0:
             hit_times = [hit_time for _, hit_time in hit_data] if hit_data else []
             first_event_stats = {
@@ -377,17 +514,17 @@ def main():
                 'hit_times': hit_times
             }
 
-    # 记录结束时间
+    # 计算性能指标
     simulation_end_time = time.time()
     end_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
 
-    # 输出性能统计
-    print(f"\nOptimized simulation completed:")
+    # 输出性能统计信息
+    print(f"\nSimulation completed:")
     print(f"  Total execution time: {simulation_end_time - simulation_start_time:.2f} seconds")
     print(f"  Memory usage: {end_memory - start_memory:.2f} MB")
     print(f"  Events per second: {args.n / (simulation_end_time - simulation_start_time):.2f}")
 
-    # 输出第一个事件的统计信息（在进度条完成后）
+    # 输出第一个事件的统计信息
     if first_event_stats:
         print(f"\nEvent 0 statistics:")
         print(f"  Position: ({first_event_stats['position'][0]:.1f}, {first_event_stats['position'][1]:.1f}, {first_event_stats['position'][2]:.1f}) mm")
@@ -400,12 +537,12 @@ def main():
             print(f"  Hit times: mean={np.mean(first_event_stats['hit_times']):.2f}ns, std={np.std(first_event_stats['hit_times']):.2f}ns")
             print(f"  Min/Max hit time: {np.min(first_event_stats['hit_times']):.2f}ns / {np.max(first_event_stats['hit_times']):.2f}ns")
 
-    # 输出结果
+    # 输出整体模拟结果统计
     print(f"\nSimulation results:")
     print(f"  Generated {len(pe_data)} PEs from {args.n} events")
     print(f"  Average PEs per event: {len(pe_data) / args.n:.2f}")
 
-    # 保存结果
+    # 保存结果到HDF5文件
     try:
         with h5.File(args.opt, "w") as opt:
             # 创建ParticleTruth数据集
@@ -437,7 +574,7 @@ def main():
                                                    ("ChannelID", "<i4"),
                                                    ("PETime", "<f8")])
 
-            # 添加元数据
+            # 添加模拟元数据和参数
             opt.attrs["target_pmt_id"] = TARGET_PMT_ID if TARGET_PMT_ID is not None else -1
             opt.attrs["n_events"] = args.n
             opt.attrs["n_photons_per_event"] = N_PHOTONS
